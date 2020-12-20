@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Demo repository used to launch CloudFormation templates
+
+Parameters:
+
+  LatestUbunut18AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/18.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-017fda3fe58144bc1
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-02067c58d46b8220d
+
+
+# Simple S3 bucket for demo purposes.
+Resources:
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties: {}
+
+  # See link below to understand how we install the CodeDeploy agent:
+  # https://github.com/awslabs/aws-cloudformation-templates/blob/master/aws/solutions/HelperNonAmaznAmi/ubuntu16.04LTS_cfn-hup.template
+  # https://aws.amazon.com/premiumsupport/knowledge-center/install-cloudformation-scripts/
+  # https://aws.amazon.com/premiumsupport/knowledge-center/codedeploy-agent-launch-configuration/
+  WebServerEC2: 
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: '1'
+        Timeout: PT5M
+    Properties: 
+      ImageId: !Ref LatestUbunut18AmiId
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      InstanceType: t3.medium
+      Tags:
+        - 
+          Key: Name
+          Value: devops-webserver
+        - 
+          Key: CodeDeployGroup
+          Value: dev-ops-webserver-demo
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: true
+          DeviceIndex: "0"
+          GroupSet: 
+            - !Ref WebServerSecurityGroup
+          SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe\n
+          
+          # SETUP CFN-INIT
+          #---------------------------
+          apt-get update -y
+          apt-get install -y python-setuptools
+          mkdir -p /opt/aws/bin
+          wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          python -m easy_install --script-dir /opt/aws/bin aws-cfn-bootstrap-latest.tar.gz
+
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} \
+            --resource WebServerEC2 \
+            --configsets full_install \
+            --region ${AWS::Region} \
+          
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} \
+              --resource WebServerEC2 \
+              --region ${AWS::Region}
+
+          ## Code Deploy Agent Bootstrap Script##
+          #-------------------------------------#
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          AUTOUPDATE=true
+
+          function installdep(){
+
+          if [ ${!PLAT} = "ubuntu" ]; then
+
+            apt-get -y update
+            # Satisfying even ubuntu older versions.
+            apt-get -y install jq awscli ruby2.0 || apt-get -y install jq awscli ruby
+
+          elif [ ${!PLAT} = "amz" ]; then
+            yum -y update
+            yum install -y aws-cli ruby jq
+          fi
+
+          }
+
+          function platformize(){
+
+          #Linux OS detection#
+          if hash lsb_release; then
+            echo "Ubuntu server OS detected"
+            export PLAT="ubuntu"
+
+          elif hash yum; then
+            echo "Amazon Linux detected"
+            export PLAT="amz"
+
+          else
+            echo "Unsupported release"
+            exit 1
+
+          fi
+          }
+          function execute(){
+
+          if [ ${!PLAT} = "ubuntu" ]; then
+
+            cd /tmp/
+            wget https://aws-codedeploy-${!REGION}.s3.amazonaws.com/latest/install
+            chmod +x ./install
+
+            if ./install auto; then
+              echo "Instalation completed"
+                if ! ${!AUTOUPDATE}; then
+                      echo "Disabling Auto Update"
+                      sed -i '/@reboot/d' /etc/cron.d/codedeploy-agent-update
+                      chattr +i /etc/cron.d/codedeploy-agent-update
+                      rm -f /tmp/install
+                fi
+              exit 0
+            else
+              echo "Instalation script failed, please investigate"
+              rm -f /tmp/install
+              exit 1
+            fi
+
+          elif [ ${!PLAT} = "amz" ]; then
+
+            cd /tmp/
+            wget https://aws-codedeploy-${!REGION}.s3.amazonaws.com/latest/install
+            chmod +x ./install
+
+              if ./install auto; then
+                echo "Instalation completed"
+                  if ! ${!AUTOUPDATE}; then
+                      echo "Disabling auto update"
+                      sed -i '/@reboot/d' /etc/cron.d/codedeploy-agent-update
+                      chattr +i /etc/cron.d/codedeploy-agent-update
+                      rm -f /tmp/install
+                  fi
+                exit 0
+              else
+                echo "Instalation script failed, please investigate"
+                rm -f /tmp/install
+                exit 1
+              fi
+
+          else
+            echo "Unsupported platform ''${!PLAT}''"
+          fi
+
+          }
+
+          platformize
+          installdep
+          REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r ".region")
+          execute
+
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          full_install:
+          - install_and_enable_cfn_hup
+        install_and_enable_cfn_hup:
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              content:
+                Fn::Join:
+                - ''
+                - - "[main]\n"
+                  - stack=
+                  - Ref: AWS::StackId
+                  - "\n"
+                  - region=
+                  - Ref: AWS::Region
+                  - "\n"
+              mode: '000400'
+              owner: root
+              group: root
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content:
+                Fn::Join:
+                - ''
+                - - "[cfn-auto-reloader-hook]\n"
+                  - 'triggers=post.update
+
+                    '
+                  - 'path=Resources.WebServerEC2.Metadata.AWS::CloudFormation::Init
+
+                    '
+                  - 'action=/opt/aws/bin/cfn-init -v '
+                  - "         --stack "
+                  - Ref: AWS::StackName
+                  - "         --resource WebServerEC2 "
+                  - "         --configsets full_install "
+                  - "         --region "
+                  - Ref: AWS::Region
+                  - "\n"
+                  - 'runas=root
+
+                    '
+            "/lib/systemd/system/cfn-hup.service":
+              content:
+                Fn::Join:
+                - ''
+                - - "[Unit]\n"
+                  - "Description=cfn-hup daemon\n\n"
+                  - "[Service]\n"
+                  - 'Type=simple
+
+                    '
+                  - 'ExecStart=/opt/aws/bin/cfn-hup
+
+                    '
+                  - "Restart=always\n\n"
+                  - "[Install]\n"
+                  - WantedBy=multi-user.target
+          commands:
+            01enable_cfn_hup:
+              command: systemctl enable cfn-hup.service
+            02start_cfn_hup:
+              command: systemctl start cfn-hup.service
+  
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupDescription: Allow http to client host
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+          
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: !Ref WebServerEc2IamRole
+      Roles: 
+        - !Ref WebServerEc2IamRole
+
+  # By attaching the AmazonEC2RoleforSSM policy to our EC2, we can use
+  # Systems Manager services like Sessions Manager for remote connections.
+  WebServerEc2IamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      Policies:
+        - PolicyName: PermissionToDownloadCodeDeployAgent
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource:
+                  - !Sub "arn:aws:s3:::aws-codedeploy-${AWS::Region}/*"
