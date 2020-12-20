@@ -18,9 +18,6 @@ Parameters:
 
 # Simple S3 bucket for demo purposes.
 Resources:
-  S3Bucket:
-    Type: 'AWS::S3::Bucket'
-    Properties: {}
 
   # See link below to understand how we install the CodeDeploy agent:
   # https://github.com/awslabs/aws-cloudformation-templates/blob/master/aws/solutions/HelperNonAmaznAmi/ubuntu16.04LTS_cfn-hup.template
