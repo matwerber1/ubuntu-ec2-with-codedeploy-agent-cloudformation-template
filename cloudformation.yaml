@@ -48,8 +48,11 @@ Resources:
           SubnetId: !Ref PublicSubnet
       UserData:
         Fn::Base64: !Sub |
-          #!/bin/bash -xe\n
+          #!/bin/bash -xe
           
+          # Log output to files, if needed:
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
           # SETUP CFN-INIT
           #---------------------------
           apt-get update -y
@@ -58,172 +61,93 @@ Resources:
           wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
           python -m easy_install --script-dir /opt/aws/bin aws-cfn-bootstrap-latest.tar.gz
 
+          # Run the CFN-INIT scripts defined in metadata...
           /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} \
             --resource WebServerEC2 \
             --configsets full_install \
             --region ${AWS::Region} \
-          
-            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} \
-              --resource WebServerEC2 \
-              --region ${AWS::Region}
-
-          ## Code Deploy Agent Bootstrap Script##
-          #-------------------------------------#
-          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-          AUTOUPDATE=true
-
-          function installdep(){
-
-          if [ ${!PLAT} = "ubuntu" ]; then
-
-            apt-get -y update
-            # Satisfying even ubuntu older versions.
-            apt-get -y install jq awscli ruby2.0 || apt-get -y install jq awscli ruby
-
-          elif [ ${!PLAT} = "amz" ]; then
-            yum -y update
-            yum install -y aws-cli ruby jq
-          fi
-
-          }
-
-          function platformize(){
-
-          #Linux OS detection#
-          if hash lsb_release; then
-            echo "Ubuntu server OS detected"
-            export PLAT="ubuntu"
-
-          elif hash yum; then
-            echo "Amazon Linux detected"
-            export PLAT="amz"
-
-          else
-            echo "Unsupported release"
-            exit 1
-
-          fi
-          }
-          function execute(){
-
-          if [ ${!PLAT} = "ubuntu" ]; then
-
-            cd /tmp/
-            wget https://aws-codedeploy-${!REGION}.s3.amazonaws.com/latest/install
-            chmod +x ./install
-
-            if ./install auto; then
-              echo "Instalation completed"
-                if ! ${!AUTOUPDATE}; then
-                      echo "Disabling Auto Update"
-                      sed -i '/@reboot/d' /etc/cron.d/codedeploy-agent-update
-                      chattr +i /etc/cron.d/codedeploy-agent-update
-                      rm -f /tmp/install
-                fi
-              exit 0
-            else
-              echo "Instalation script failed, please investigate"
-              rm -f /tmp/install
-              exit 1
-            fi
-
-          elif [ ${!PLAT} = "amz" ]; then
-
-            cd /tmp/
-            wget https://aws-codedeploy-${!REGION}.s3.amazonaws.com/latest/install
-            chmod +x ./install
-
-              if ./install auto; then
-                echo "Instalation completed"
-                  if ! ${!AUTOUPDATE}; then
-                      echo "Disabling auto update"
-                      sed -i '/@reboot/d' /etc/cron.d/codedeploy-agent-update
-                      chattr +i /etc/cron.d/codedeploy-agent-update
-                      rm -f /tmp/install
-                  fi
-                exit 0
-              else
-                echo "Instalation script failed, please investigate"
-                rm -f /tmp/install
-                exit 1
-              fi
-
-          else
-            echo "Unsupported platform ''${!PLAT}''"
-          fi
-
-          }
-
-          platformize
-          installdep
-          REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r ".region")
-          execute
-
 
     Metadata:
       AWS::CloudFormation::Init:
         configSets:
           full_install:
-          - install_and_enable_cfn_hup
+            - install_and_enable_cfn_hup
+            - install_codedeploy_agent
         install_and_enable_cfn_hup:
           files:
             "/etc/cfn/cfn-hup.conf":
-              content:
-                Fn::Join:
-                - ''
-                - - "[main]\n"
-                  - stack=
-                  - Ref: AWS::StackId
-                  - "\n"
-                  - region=
-                  - Ref: AWS::Region
-                  - "\n"
               mode: '000400'
               owner: root
               group: root
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region
             "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
-              content:
-                Fn::Join:
-                - ''
-                - - "[cfn-auto-reloader-hook]\n"
-                  - 'triggers=post.update
-
-                    '
-                  - 'path=Resources.WebServerEC2.Metadata.AWS::CloudFormation::Init
-
-                    '
-                  - 'action=/opt/aws/bin/cfn-init -v '
-                  - "         --stack "
-                  - Ref: AWS::StackName
-                  - "         --resource WebServerEC2 "
-                  - "         --configsets full_install "
-                  - "         --region "
-                  - Ref: AWS::Region
-                  - "\n"
-                  - 'runas=root
-
-                    '
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.WebServerEC2.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v \
+                  --stack ${AWS::StackName} \
+                  --resource WebServerEC2 \
+                  --configsets full_install \
+                  --region ${AWS::Region}
+                runas=root
             "/lib/systemd/system/cfn-hup.service":
-              content:
-                Fn::Join:
-                - ''
-                - - "[Unit]\n"
-                  - "Description=cfn-hup daemon\n\n"
-                  - "[Service]\n"
-                  - 'Type=simple
-
-                    '
-                  - 'ExecStart=/opt/aws/bin/cfn-hup
-
-                    '
-                  - "Restart=always\n\n"
-                  - "[Install]\n"
-                  - WantedBy=multi-user.target
+              content: !Sub |
+                [Unit]
+                Description=cfn-hup daemon
+                [Service]
+                Type=simple
+                ExecStart=/opt/aws/bin/cfn-hup
+                Restart=always
+                [Install]
+                WantedBy=multi-user.target
           commands:
             01enable_cfn_hup:
               command: systemctl enable cfn-hup.service
             02start_cfn_hup:
               command: systemctl start cfn-hup.service
+        install_codedeploy_agent:
+          commands:
+            00-install-agent:
+              command: "./codedeploy-install-script.sh"
+              cwd: "/home/ubuntu/"
+            01-cfn-signal:
+              command: !Sub "/opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource WebServerEC2 --region ${AWS::Region}"
+          files:
+            "/home/ubuntu/codedeploy-install-script.sh":
+              mode: "000755"
+              content: !Sub |   
+                #!/bin/bash -xe
+                             
+                # Automatically update the CodeDeploy agent:
+                AUTOUPDATE=true
+                
+                # Install dependencies for CodeDeploy/install process:
+                apt-get -y update
+                apt-get -y install jq awscli ruby2.0 || apt-get -y install jq awscli ruby
+                function execute(){
+                  cd /tmp/
+                  wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
+                  chmod +x ./install
+                  if ./install auto; then
+                    echo "Instalation completed"
+                      if ! ${!AUTOUPDATE}; then
+                        echo "Disabling Auto Update"
+                        sed -i '/@reboot/d' /etc/cron.d/codedeploy-agent-update
+                        chattr +i /etc/cron.d/codedeploy-agent-update
+                        rm -f /tmp/install
+                      fi
+                    exit 0
+                  else
+                    echo "Instalation script failed, please investigate"
+                    rm -f /tmp/install
+                    exit 1
+                  fi
+                }
+                execute
   
   WebServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
